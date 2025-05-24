@@ -636,8 +636,8 @@ pub fn udev_monitor_receive_device(monitor: &mut UdevMonitor) -> Result<UdevDevi
 pub fn udev_monitor_filter_add_match_subsystem_devtype<'m>(
     monitor: &'m mut UdevMonitor,
     subsystem: &str,
-    devtype: &str,
-) -> Result<&'m UdevEntry> {
+    devtype: Option<&str>,
+) -> Result<()> {
     monitor.filter_add_match_subsystem_devtype(subsystem, devtype)
 }
 

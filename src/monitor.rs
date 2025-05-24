@@ -114,6 +114,9 @@ impl<const N: usize> Default for BpfFilters<N> {
     }
 }
 
+pub type UdevSubsystemFilter = (String, Option<String>);
+pub type UdevSubsystemFilterList = Vec<UdevSubsystemFilter>;
+
 /// Handles device event sources.
 pub struct UdevMonitor {
     udev: Arc<Udev>,
@@ -124,7 +127,7 @@ pub struct UdevMonitor {
     snl_destination: UdevSocket,
     snl_destination_group: UdevMonitorNetlinkGroup,
     addrlen: usize,
-    filter_subsystem_list: UdevList,
+    filter_subsystem_list: UdevSubsystemFilterList,
     filter_tag_list: UdevList,
     bound: bool,
     filter: BpfFilters<BPF_FILTER_LEN>,
@@ -133,7 +136,6 @@ pub struct UdevMonitor {
 impl UdevMonitor {
     /// Creates a new [UdevMonitor].
     pub fn new(udev: Arc<Udev>) -> Result<Self> {
-        let filter_subsystem_list = UdevList::new(Arc::clone(&udev));
         let filter_tag_list = UdevList::new(Arc::clone(&udev));
 
         Ok(Self {
@@ -145,7 +147,7 @@ impl UdevMonitor {
             snl_destination: UdevSocket::new_nl(libc::AF_NETLINK, 0, 0),
             snl_destination_group: UdevMonitorNetlinkGroup::None,
             addrlen: mem::size_of::<libc::sockaddr_nl>(),
-            filter_subsystem_list,
+            filter_subsystem_list: Vec::new(),
             filter_tag_list,
             bound: false,
             filter: BpfFilters::new(),
@@ -400,22 +402,22 @@ impl UdevMonitor {
     }
 
     /// Gets a reference to the filter subsystem [UdevList].
-    pub const fn filter_subsystem_list(&self) -> &UdevList {
+    pub const fn filter_subsystem_list(&self) -> &UdevSubsystemFilterList {
         &self.filter_subsystem_list
     }
 
     /// Gets a mutable reference to the filter subsystem [UdevList].
-    pub fn filter_subsystem_list_mut(&mut self) -> &mut UdevList {
+    pub fn filter_subsystem_list_mut(&mut self) -> &mut UdevSubsystemFilterList {
         &mut self.filter_subsystem_list
     }
 
     /// Sets the filter subsystem [UdevList].
-    pub fn set_filter_subsystem_list<L: Into<UdevEntryList>>(&mut self, list: L) {
-        self.filter_subsystem_list.set_list(list);
+    pub fn set_filter_subsystem_list<L: Into<UdevSubsystemFilterList>>(&mut self, list: L) {
+        self.filter_subsystem_list = list.into();
     }
 
     /// Builder function that sets the filter subsystem [UdevList].
-    pub fn with_filter_subsystem_list<L: Into<UdevEntryList>>(mut self, list: L) -> Self {
+    pub fn with_filter_subsystem_list<L: Into<UdevSubsystemFilterList>>(mut self, list: L) -> Self {
         self.set_filter_subsystem_list(list);
         self
     }
@@ -457,20 +459,27 @@ impl UdevMonitor {
 
     /// Gets whether the [UdevDevice] passes the [UdevMonitor] filters.
     pub fn passes_filter(&self, device: &mut UdevDevice) -> bool {
-        if self.filter_subsystem_list.is_empty() {
-            self.filter_tag_list().has_tag(device)
-        } else {
-            for list_entry in self.filter_subsystem_list.iter() {
-                if list_entry.name() == device.get_subsystem() {
-                    let (devtype, ddevtype) = (list_entry.value(), device.devtype());
+        // TODO: Verify logic with systemd bpf filters
 
-                    if !ddevtype.is_empty() && (devtype.is_empty() || devtype == ddevtype) {
-                        return self.filter_tag_list().has_tag(device);
-                    }
-                }
-            }
-            false
+        if !self.filter_tag_list.is_empty() {
+            return self.filter_tag_list.has_tag(device);
         }
+        if !self.filter_subsystem_list.is_empty() {
+            return self
+                .filter_subsystem_list
+                .iter()
+                .any(|(subsystem, devtype)| {
+                    if subsystem != device.get_subsystem() {
+                        return false;
+                    }
+
+                    if let Some(devtype) = devtype {
+                        return devtype == device.devtype();
+                    }
+                    true
+                });
+        }
+        true
     }
 
     /// Updates the monitor socket filter.
@@ -484,9 +493,7 @@ impl UdevMonitor {
     ///
     /// Returns: `Ok(())` on success, `Err(Error)` otherwise.
     pub fn filter_update(&mut self) -> Result<()> {
-        if self.filter_subsystem_list().entry().is_none()
-            && self.filter_tag_list().entry().is_none()
-        {
+        if self.filter_subsystem_list().is_empty() && self.filter_tag_list().entry().is_none() {
             Ok(())
         } else {
             let mut ins: BpfFilters<BPF_FILTER_LEN> = BpfFilters::new();
@@ -566,9 +573,9 @@ impl UdevMonitor {
             }
 
             // add all subsystem matches
-            if self.filter_subsystem_list().entry().is_some() {
-                for list_entry in self.filter_subsystem_list().iter() {
-                    let mut hash = util::string_hash32(list_entry.name());
+            if !self.filter_subsystem_list().is_empty() {
+                for (subsystem, devtype) in self.filter_subsystem_list().iter() {
+                    let mut hash = util::string_hash32(subsystem);
 
                     // load device subsystem value in A
                     ins.bpf_stmt(
@@ -577,16 +584,7 @@ impl UdevMonitor {
                         UdevMonitorNetlinkHeader::filter_subsystem_hash_offset() as u32,
                     )?;
 
-                    if list_entry.value().is_empty() {
-                        // jump if subsystem does not match
-                        ins.bpf_jmp(
-                            &mut i,
-                            (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
-                            hash,
-                            0,
-                            1,
-                        )?;
-                    } else {
+                    if let Some(devtype) = devtype {
                         // jump if subsystem does not match
                         ins.bpf_jmp(
                             &mut i,
@@ -604,7 +602,16 @@ impl UdevMonitor {
                         )?;
 
                         // jump if value does not match
-                        hash = util::string_hash32(list_entry.value());
+                        hash = util::string_hash32(devtype);
+                        ins.bpf_jmp(
+                            &mut i,
+                            (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+                            hash,
+                            0,
+                            1,
+                        )?;
+                    } else {
+                        // jump if subsystem does not match
                         ins.bpf_jmp(
                             &mut i,
                             (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
@@ -1029,16 +1036,14 @@ impl UdevMonitor {
     pub fn filter_add_match_subsystem_devtype(
         &mut self,
         subsystem: &str,
-        devtype: &str,
-    ) -> Result<&UdevEntry> {
+        devtype: Option<&str>,
+    ) -> Result<()> {
         if subsystem.is_empty() {
             Err(Error::UdevMonitor("empty subsystem filter".into()))
         } else {
-            self.filter_subsystem_list
-                .add_entry(subsystem, devtype)
-                .ok_or(Error::UdevMonitor(
-                    "unable to add entry to filter subsystem list".into(),
-                ))
+            let new_filter = (subsystem.to_string(), devtype.map(|v| v.to_string()));
+            self.filter_subsystem_list.push(new_filter);
+            Ok(())
         }
     }
 
